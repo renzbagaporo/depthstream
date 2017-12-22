@@ -4,13 +4,13 @@ A GPU-accelerated stereo vision algorithm used in http://ieeexplore.ieee.org/doc
 
 
 ## Setup
-To work with the code, you will need the following software:
+The software used to develop and test the code are as follows:
 
 * Visual Studio 2013
 * CUDA SDK 7.5 
 * OpenCV 3.0
 * Qt 5.0
-* MATLAB 2011 
+* MATLAB 2014b
 
 The implementation was targeted for a Kepler-based NVIDIA (GT735M) card with features used introduced in compute capability 3.0. It should be easy to re-target it for newer cards and compute capabilities. 
 
@@ -20,7 +20,7 @@ The root directory is /dstream. Inside the code files are logically grouped into
 
 * dscalib - contains the code used for calibrating the stereo cameras before use
 * dscore - contains the CUDA kernels used for computing disparities between stereo images
-* dsdemo - contains three demo applications (1) depthmap display (2) point cloud construction (3) tracked objected distance display
+* dsdemo - contains three demo applications: (1) colorized depthmap demo (2) point cloud demo (3) tracked object distance demo
 * dseval - contains utilty code for evaluating depthstream against the KITTI and Middlebury datasets
 * dsmain - contains the main classes used for using the algorihtm; wraps the kernels in dscore for use in an object-oriented fashion
 * dsmeasure - contains code used to measure object distances to the stereo camera
@@ -33,7 +33,6 @@ int width = 320, height = 240, disparities = 128;
 int gamma = 8 , arm_length = 17, max_arm_length = 34, arm_threshold = 15, strict_arm_threshold = 6, region_voting_iterations = 4, disparity_tolerance = 1;
 
 // Optional. Create a rectifier object. In order to create a rectifier object, a calibration file has to be created first  the code from dscalib. This is optional since other depthstream objects should be able to process stereo vision frames without a rectifier object.
-
 DSRectifier rectifier = DSRectifier("calib.yml");
 
 // Create a stereo camera stream object. The DSStream object encapsulates the stereo camera attached to the host PC.
