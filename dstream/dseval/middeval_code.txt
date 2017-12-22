@@ -1,0 +1,437 @@
+#include "opencv2\opencv.hpp"
+#include "opencv2\cudastereo.hpp"
+#include "arrayfire.h"
+#include "support.h"
+#include "DSMatcher.h"
+#include "DSFrame.h"
+
+#include <fstream>
+#include <iomanip>
+
+/*
+cv::Ptr<cv::StereoBM> bm;
+cv::Ptr<cv::StereoSGBM> sgbm;
+cv::Ptr<cv::cuda::StereoConstantSpaceBP> csbp;
+cv::Ptr<cv::cuda::StereoBeliefPropagation> bp;
+cv::Ptr<cv::cuda::StereoBM> gpu_bm;
+
+#define LOOP_NUMBER 10
+
+
+struct Dataset{
+	cv::Mat left_im;
+	cv::Mat right_im;
+
+	int width, height, channels, disp;
+	std::string name;
+
+	Dataset();
+	Dataset(cv::Mat left_im, cv::Mat right_im, int disp, std::string name){
+
+		bool check = left_im.rows == right_im.rows && left_im.cols == right_im.cols && left_im.channels() == right_im.channels();
+		CV_Assert(check);
+
+		this->left_im = left_im.clone();
+		this->right_im = right_im.clone();
+
+		this->width = (this->left_im.cols + this->right_im.cols) / 2;
+		this->height = (this->left_im.rows + this->right_im.rows) / 2;
+		this->channels = (this->left_im.channels() + this->right_im.channels()) / 2;
+		this->name = name;
+		this->disp = disp;
+	}
+};
+
+class TrainingSet{
+public:
+	std::vector<Dataset> TrainingSetCollection;
+	std::vector<std::string> TrainingSetNames;
+	std::vector<int> TrainingSetDisparities;
+	enum TrainingSetEnum{
+		Adirondack = 0, ArtL, Jadeplant, Motorcycle, MotorcycleE,
+		Piano, PianoL, Pipes, Playroom, Playtable, PlaytableP, Recycle, Shelves,
+		Teddy, Vintage
+	};
+
+	int size = 15;
+
+	TrainingSet();
+	TrainingSet(std::string path){
+
+		TrainingSetNames = { "Adirondack", "ArtL", "Jadeplant", "Motorcycle", "MotorcycleE", "Piano", "PianoL",
+			"Pipes", "Playroom", "Playtable", "PlaytableP", "Recycle", "Shelves", "Teddy", "Vintage" };
+		TrainingSetDisparities = { 73, 64, 160, 70, 70, 65, 65, 75, 83, 73, 73, 65, 60, 64, 190 };
+
+		cv::Mat left_temp, right_temp;
+
+		for (int i = 0; i < size; i++){
+			std::string dataset_path = path + "\\" + TrainingSetNames[i];
+
+			left_temp = cv::imread(dataset_path + "\\im0.png", cv::IMREAD_GRAYSCALE);
+			right_temp = cv::imread(dataset_path + "\\im1.png", cv::IMREAD_GRAYSCALE);
+
+			TrainingSetCollection.push_back(Dataset(left_temp, right_temp, TrainingSetDisparities[i], TrainingSetNames[i]));
+		}
+	}
+
+};
+
+int round_to_multiple(int num, int multiple_of){
+	return num - 1 - (num - 1) % multiple_of + multiple_of;
+}
+
+double average(std::vector<double> numbers){
+	double sum = 0;
+	for (int i = 0; i < numbers.size(); i++){
+		sum += numbers[i];
+	}
+	return sum / numbers.size();
+}
+
+void setup(int width, int height, int channels, int disp){
+
+	disp = round_to_multiple(disp, 16);
+	bm = cv::StereoBM::create(disp, 9);
+	bm->setPreFilterCap(31);
+	bm->setMinDisparity(0);
+	bm->setTextureThreshold(10);
+	bm->setUniquenessRatio(15);
+	bm->setSpeckleWindowSize(100);
+	bm->setSpeckleRange(32);
+	//bm->setDisp12MaxDiff(1);
+
+	sgbm = cv::StereoSGBM::create(0, disp, 3);
+	sgbm->setPreFilterCap(63);
+	sgbm->setP1(216 * channels);
+	sgbm->setP2(288 * channels);
+	sgbm->setMinDisparity(0);
+	sgbm->setNumDisparities(disp);
+	sgbm->setUniquenessRatio(10);
+	sgbm->setSpeckleWindowSize(100);
+	sgbm->setSpeckleRange(32);
+	sgbm->setDisp12MaxDiff(1);
+
+	gpu_bm = cv::cuda::createStereoBM(disp, 9);
+	gpu_bm->setPreFilterCap(31);
+	gpu_bm->setMinDisparity(0);
+	gpu_bm->setTextureThreshold(10);
+	gpu_bm->setUniquenessRatio(15);
+	gpu_bm->setSpeckleWindowSize(100);
+	gpu_bm->setSpeckleRange(32);
+	gpu_bm->setDisp12MaxDiff(1);
+
+	int ndisp, iters, levels, nrplane;
+
+	cv::cuda::StereoConstantSpaceBP::estimateRecommendedParams(width, height, ndisp, iters, levels, nrplane);
+	csbp = cv::cuda::createStereoConstantSpaceBP(disp, iters, levels, nrplane);
+
+	cv::cuda::StereoBeliefPropagation::estimateRecommendedParams(width, height, ndisp, iters, levels);
+	bp = cv::cuda::createStereoBeliefPropagation(disp, iters, levels);
+}
+
+void pfm_write(cv::Mat im, std::string path, std::string filename){
+
+	filename = path + "\\" + filename;
+
+	int channels = im.channels();
+	cv::Mat temp_im;
+
+	if (im.channels() == 1 || im.channels() == 3){
+
+		if (im.channels() == 1)
+			im.convertTo(temp_im, CV_32FC1);
+		else if (im.channels() == 3){
+			im.convertTo(temp_im, CV_32FC3);
+			cv::cvtColor(temp_im, temp_im, CV_BGR2RGB);
+		}
+		else{}
+
+		cv::flip(temp_im, temp_im, 0);
+		temp_im = temp_im.setTo(std::numeric_limits<float>::infinity(), temp_im <= 0);
+
+		std::ofstream ofs(filename.c_str(), std::ios::binary);
+		if (ofs.is_open()){
+			ofs << (channels == 1 ? "Pf\n" : "PF\n") << im.cols << ' ' << im.rows << "\n" << "-1.0\n";
+			ofs.write(reinterpret_cast<const char*>(temp_im.data), temp_im.rows * temp_im.cols * temp_im.channels() * sizeof(float));
+			ofs.close();
+		}
+	}
+}
+
+void time_write(double time, std::string path, std::string filename){
+	filename = path + "\\" + filename;
+	std::ofstream ofs;
+	ofs.open(filename);
+
+	if (ofs.is_open()){
+		ofs << time;
+		ofs.close();
+	}
+}
+
+*/
+
+int main(){
+
+	/*
+	std::string path = "C:\\Users\\renzb\\Documents\\Visual Studio 2013\\Projects\\depthstream\\dstream\\middeval";
+
+	//Initialize training set
+	TrainingSet ts(path + "\\data");
+
+
+	for (int i = 0; i < 15; i++){
+	Dataset ds = ts.TrainingSetCollection[i];
+	setup(ds.width, ds.height, ds.channels, ds.disp);
+	cv::Mat result; cv::cuda::GpuMat gpu_result;
+
+	//DSTREAM
+	{
+	DSMatcher dstream = DSMatcher(ds.width, ds.height, ds.channels, ds.disp, 0);
+	dstream.set_matching_params(70, false, 8, 17, 15, 6);
+
+	dstream.set_refinement_params(0, 1, false, 5);
+
+	DSFrame frame = DSFrame(ds.left_im, ds.right_im);
+
+	std::vector<double> times;
+	for (int i = 0; i < LOOP_NUMBER; i++){
+	af::timer::start();
+	dstream.compute(frame, result);
+	times.push_back(af::timer::stop());
+	}
+
+	cv::medianBlur(result, result, 3);
+	pfm_write(result, path + "\\result-DSTREAM\\trainingQ\\" + ds.name, "disp0DSTREAM_s.pfm");
+	time_write(average(times), path + "\\result-DSTREAM\\trainingQ\\" + ds.name, "timeDSTREAM.txt");
+	}
+	}
+
+	for (int i = 0; i < 15; i++){
+	Dataset ds = ts.TrainingSetCollection[i];
+	setup(ds.width, ds.height, ds.channels, ds.disp);
+	cv::Mat result; cv::cuda::GpuMat gpu_result;
+
+	//BM
+	std::vector<double> times;
+	for (int i = 0; i < LOOP_NUMBER; i++){
+	af::timer::start();
+	bm->compute(ds.left_im, ds.right_im, result);
+	times.push_back(af::timer::stop());
+	}
+
+	result.convertTo(result, CV_32FC1); result /= 16.0f;
+	pfm_write(result, path + "\\result-OCVBM\\trainingQ\\" + ds.name, "disp0OCVBM_s.pfm");
+	time_write(average(times), path + "\\result-OCVBM\\trainingQ\\" + ds.name, "timeOCVBM.txt");
+	}
+
+	for (int i = 0; i < 15; i++){
+	Dataset ds = ts.TrainingSetCollection[i];
+	setup(ds.width, ds.height, ds.channels, ds.disp);
+	cv::Mat result; cv::cuda::GpuMat gpu_result;
+
+	//SGBM
+	std::vector<double> times;
+	sgbm->setMode(cv::StereoSGBM::MODE_SGBM);
+	for (int i = 0; i < LOOP_NUMBER; i++){
+	af::timer::start();
+	sgbm->compute(ds.left_im, ds.right_im, result);
+	times.push_back(af::timer::stop());
+	}
+
+	result.convertTo(result, CV_32FC1); result /= 16.0f;
+	pfm_write(result, path + "\\result-OCVSGBM\\trainingQ\\" + ds.name, "disp0OCVSGBM_s.pfm");
+	time_write(average(times), path + "\\result-OCVSGBM\\trainingQ\\" + ds.name, "timeOCVSGBM.txt");
+	}
+
+	for (int i = 0; i < 15; i++){
+	Dataset ds = ts.TrainingSetCollection[i];
+	setup(ds.width, ds.height, ds.channels, ds.disp);
+	cv::Mat result; cv::cuda::GpuMat gpu_result;
+
+	//SGBM_HH
+	std::vector<double> times;
+	sgbm->setMode(cv::StereoSGBM::MODE_HH);
+	for (int i = 0; i < LOOP_NUMBER; i++){
+	af::timer::start();
+	sgbm->compute(ds.left_im, ds.right_im, result);
+	times.push_back(af::timer::stop());
+	}
+
+	result.convertTo(result, CV_32FC1); result /= 16.0f;
+	pfm_write(result, path + "\\result-OCVSGBMHH\\trainingQ\\" + ds.name, "disp0OCVSGBMHH_s.pfm");
+	time_write(average(times), path + "\\result-OCVSGBMHH\\trainingQ\\" + ds.name, "timeOCVSGBMHH.txt");
+	}
+
+	for (int i = 0; i < 15; i++){
+	Dataset ds = ts.TrainingSetCollection[i];
+	setup(ds.width, ds.height, ds.channels, ds.disp);
+	cv::Mat result; cv::cuda::GpuMat gpu_result;
+	cv::cuda::GpuMat left_im = cv::cuda::GpuMat(ds.left_im);
+	cv::cuda::GpuMat right_im = cv::cuda::GpuMat(ds.right_im);
+
+	//GPU_BM
+	std::vector<double> times;
+	for (int i = 0; i < LOOP_NUMBER; i++){
+	af::timer::start();
+	gpu_bm->compute(left_im, right_im, gpu_result);
+	times.push_back(af::timer::stop());
+	}
+
+	result = cv::Mat(gpu_result);
+	pfm_write(result, path + "\\result-OCVBMGPU\\trainingQ\\" + ds.name, "disp0OCVBMGPU_s.pfm");
+	time_write(average(times), path + "\\result-OCVBMGPU\\trainingQ\\" + ds.name, "timeOCVBMGPU.txt");
+	}
+	*/
+
+	//Read KITTI Dataset
+	std::vector<cv::Mat> right_images;
+	std::vector<cv::Mat> left_images;
+
+	std::vector<std::string> image_names;
+
+	for (int i = 0; i <= 193; i++){
+		//Read images
+		std::stringstream file_number;
+		file_number << std::setw(3) << std::setfill('0') << i;
+		std::string image_name = "000" + file_number.str() + "_10.png";
+		image_names.push_back(image_name);
+
+		left_images.push_back(cv::imread("C:/Users/renzb/Documents/Visual Studio 2013/Projects/depthstream/dstream/kitteval/data_stereo_flow/training/image_0/" + image_name, cv::IMREAD_GRAYSCALE));
+		right_images.push_back(cv::imread("C:/Users/renzb/Documents/Visual Studio 2013/Projects/depthstream/dstream/kitteval/data_stereo_flow/training/image_1/" + image_name, cv::IMREAD_GRAYSCALE));
+	}
+
+	
+	////BM
+	//{
+	//	cv::Ptr<cv::StereoBM> bm;
+	//	bm = cv::StereoBM::create(128, 9);
+	//	bm->setPreFilterCap(31);
+	//	bm->setMinDisparity(0);
+	//	bm->setTextureThreshold(10);
+	//	bm->setUniquenessRatio(15);
+	//	bm->setSpeckleWindowSize(100);
+	//	bm->setSpeckleRange(32);
+	//	//bm->setDisp12MaxDiff(1);
+
+	//	double sum = 0;
+
+	//	for (int i = 0; i <= 193; i++){
+	//		cv::Mat disparity;
+
+	//		af::timer::start();
+	//		bm->compute(left_images[i], right_images[i], disparity);
+	//		sum += af::timer::stop();
+
+	//		disparity = disparity.setTo(0, disparity <= 0);
+	//		disparity.convertTo(disparity, CV_16UC1);
+	//		disparity *= 16;
+	//		cv::imwrite("C:/Users/renzb/Documents/Visual Studio 2013/Projects/depthstream/dstream/kitteval/results/OCVBM/" + image_names[i], disparity);
+	//	}
+
+	//	std::cout << "BM Time: " << sum / 193.0 << std::endl;
+	//}
+
+
+	//DSTREAM
+	{
+		double sum = 0;
+
+		for (int i = 0; i <= 193; i++){
+			DSMatcher dstream = DSMatcher(left_images[i].cols, left_images[i].rows, 1, 256, 0);
+			dstream.set_matching_params(70, 8, 17, 15, 6);
+
+			dstream.set_refinement_params(0, 1, false, 5);
+
+			DSFrame frame = DSFrame(left_images[i], right_images[i]);
+
+			cv::Mat disparity;
+
+			af::timer::start();
+			dstream.compute(frame, disparity);
+			sum += af::timer::stop();
+
+			cv::medianBlur(disparity, disparity, 3);
+
+			disparity = disparity.setTo(0, disparity <= 0);
+			disparity.convertTo(disparity, CV_16UC1);
+			disparity *= 256;
+			cv::imwrite("C:/Users/renzb/Documents/Visual Studio 2013/Projects/depthstream/dstream/kitteval/results/DSTREAM/" + image_names[i], disparity);
+
+			//show(disparity);
+		}
+		std::cout << "DSTREAM Time: " << sum / 193.0 << std::endl;
+	}
+
+
+
+	////SGBM
+	//{
+	//	cv::Ptr<cv::StereoSGBM> sgbm;
+	//	sgbm = cv::StereoSGBM::create(0, 256, 3);
+	//	sgbm->setPreFilterCap(63);
+	//	sgbm->setP1(216 * 1);
+	//	sgbm->setP2(288 * 1);
+	//	sgbm->setMinDisparity(0);
+	//	sgbm->setNumDisparities(256);
+	//	sgbm->setUniquenessRatio(10);
+	//	sgbm->setSpeckleWindowSize(100);
+	//	sgbm->setSpeckleRange(32);
+	//	sgbm->setDisp12MaxDiff(1);
+
+	//	double sum = 0;
+
+	//	for (int i = 0; i <= 193; i++){
+	//		cv::Mat disparity;
+
+	//		af::timer::start();
+	//		sgbm->compute(left_images[i], right_images[i], disparity);
+	//		sum += af::timer::stop();
+
+	//		disparity = disparity.setTo(0, disparity <= 0);
+	//		disparity.convertTo(disparity, CV_16UC1);
+	//		disparity *= 16;
+	//		cv::imwrite("C:/Users/renzb/Documents/Visual Studio 2013/Projects/depthstream/dstream/kitteval/results/OCVSGBM/" + image_names[i], disparity);
+	//	}
+
+	//	std::cout << "SGBM Time: " << sum / 193.0 << std::endl;
+	//}
+
+	////SGBM-HH
+	//{
+	//	cv::Ptr<cv::StereoSGBM> sgbm;
+	//	sgbm = cv::StereoSGBM::create(0, 256, 3);
+	//	sgbm->setPreFilterCap(63);
+	//	sgbm->setP1(216 * 1);
+	//	sgbm->setP2(288 * 1);
+	//	sgbm->setMinDisparity(0);
+	//	sgbm->setNumDisparities(256);
+	//	sgbm->setUniquenessRatio(10);
+	//	sgbm->setSpeckleWindowSize(100);
+	//	sgbm->setSpeckleRange(32);
+	//	sgbm->setDisp12MaxDiff(1);
+	//	sgbm->setMode(cv::StereoSGBM::MODE_HH);
+
+	//	double sum = 0;
+
+	//	for (int i = 0; i <= 193; i++){
+	//		cv::Mat disparity;
+
+	//		af::timer::start();
+	//		sgbm->compute(left_images[i], right_images[i], disparity);
+	//		sum += af::timer::stop();
+
+	//		disparity = disparity.setTo(0, disparity <= 0);
+	//		disparity.convertTo(disparity, CV_16UC1);
+	//		disparity *= 16;
+	//		cv::imwrite("C:/Users/renzb/Documents/Visual Studio 2013/Projects/depthstream/dstream/kitteval/results/OCVSGBMHH/" + image_names[i], disparity);
+	//	}
+
+	//	std::cout << "SGBM-HH Time: " << sum / 193.0 << std::endl;
+	//}
+
+
+
+
+	return 0;
+}
